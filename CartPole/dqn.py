@@ -6,7 +6,7 @@ import numpy as np
 from collections import deque
 
 GAMMA = 0.99
-TRAINING = 1500
+TRAINING = 2500
 EVAL = 100
 LR = 1e-2
 UPDATE = 75

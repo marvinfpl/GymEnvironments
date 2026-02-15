@@ -8,14 +8,14 @@ from collections import deque
 GAMMA = 0.99
 TRAINING = 2500
 EVAL = 100
-LR = 1e-2
+LR = 1e-3
 UPDATE = 75
 BATCH_SIZE = 64
 EPS = 0.995
 EPS_DECAY = 0.95
 MIN_EPS = 0.005
 
-buffer = deque(maxlen=1000)
+buffer = deque(maxlen=10000)
 
 env = gym.make("CartPole-v1")
 n_states = env.observation_space.shape[0]
@@ -60,15 +60,21 @@ def train():
     actions = torch.tensor(action, dtype=torch.int64).unsqueeze(1)
     next_states = torch.tensor(next_state, dtype=torch.float32)
     rewards = torch.tensor(reward, dtype=torch.float32)
-    dones = torch.tensor(done, dtype=torch.bool)
+    dones = torch.tensor(done, dtype=torch.float32)
 
-    q_values = dqn(states).gather(1, actions).squeeze(1)
+    q_values = dqn(states)
+    q_value = q_values.gather(1, actions).squeeze(1)
 
     with torch.no_grad():
-        next_q_values = target_network(next_states).max(1)[0]
-        target = rewards + GAMMA * next_q_values * (~dones)
+        next_q_online = dqn(next_states)
+        next_actions = next_q_online.argmax(1)
 
-    loss = nn.MSELoss()(q_values, target)
+        next_q_target = target_network(next_states)
+        next_q_value = next_q_target.gather(1, next_actions.unsqueeze(1)).squeeze(1)
+
+        target = rewards + GAMMA * next_q_value * (1.0 - dones)
+
+    loss = nn.MSELoss()(q_value, target)
 
     optimizer.zero_grad()
     loss.backward()
@@ -106,7 +112,7 @@ for episode in range(TRAINING):
     if episode % 50 == 0:
         print(f" --- Episode: {episode}, Total Reward: {total_reward}, Mean Reward: {np.mean(rewards)} --- ")
 
-    EPS = min(EPS*EPS_DECAY, MIN_EPS)
+    EPS = max(EPS*EPS_DECAY, MIN_EPS)
 
     if np.mean(rewards) >= 450:
         print("CartPole solved!")

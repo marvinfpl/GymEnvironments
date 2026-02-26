@@ -3,14 +3,14 @@ import torch.optim as optim
 from collections import deque
 import wandb 
 import numpy as np
-from utils import * 
+from utils import reward_shaping, polyak_averaging
 import gymnasium as gym
 from network import DeepQNetwork
 from buffer import Buffer
 
-env = gym.make("MountainCar-v0")
-n_states = env.observation_space.shape[0]
-n_actions = env.action_space.n 
+envs = gym.make_vec("MountainCar-v0", num_envs=5, vectorization_mode="sync")
+n_states = envs.observation_space.shape[0]
+n_actions = envs.action_space.n 
 
 state_dist = {}
 action_dist = {}
@@ -19,6 +19,7 @@ GAMMA = 0.99
 TRAINING = 1000
 EVAL = 10
 UPDATE_TGT = 30
+HIDDEN = 128
 TAU = 0.05
 LR = 2e-3
 BUFFER_SIZE = 100_000
@@ -45,6 +46,7 @@ wandb.init(
         "training": TRAINING,
         "eval": EVAL,
         "update_target": UPDATE_TGT,
+        "hidden": HIDDEN,
         "tau": TAU,
         "learning_rate": LR,
         "clip_grad_norm": CLIP,
@@ -63,7 +65,7 @@ wandb.init(
     }
 )
 """
-dqn = DeepQNetwork(n_states, n_actions)
+dqn = DeepQNetwork(n_states, n_actions, HIDDEN)
 optimizer = optim.Adam(dqn.value.parameters(), lr=LR)
 target_net = DeepQNetwork(n_states, n_actions)
 target_net.load_state_dict(dqn.state_dict())
@@ -109,7 +111,7 @@ dqn.train()
 target_net.eval()
 
 for episode in range(TRAINING):
-    state, _ = env.reset()
+    state, _ = envs.reset()
     old_total_reward = 0.0
     shaped_total_reward = 0.0
     done = False
@@ -125,7 +127,7 @@ for episode in range(TRAINING):
             state_dist[state.tolist()] += 1
         """
         if np.random.rand() < EPS:
-            action = env.action_space.sample()
+            action = envs.action_space.sample()
         else:
             action = dqn(state_t).argmax().item()
 
@@ -136,11 +138,11 @@ for episode in range(TRAINING):
             action_dist[action] += 1
         """
 
-        next_state, old_reward, terminated, truncated, _ = env.step(action)
+        next_state, old_reward, terminated, truncated, _ = envs.step(action)
         old_total_reward += old_reward
         done = terminated or truncated
 
-        new_reward = reward_shaping(old_reward, state, next_state, done, GAMMA)
+        new_reward = reward_shaping(old_reward, state, next_state, done, GAMMA, True)
         shaped_total_reward += new_reward
 
         buffer.append((state, action, next_state, new_reward, done))
@@ -185,7 +187,7 @@ for episode in range(TRAINING):
     )
     """
             
-env.close()
+envs.close()
 
 eval_env = gym.make("MountainCar-v0", render_mode="human")
 dqn.eval()
@@ -201,7 +203,7 @@ for episode in range(EVAL):
         action = dqn(state_t).argmax(dim=1).item()
         next_state, old_reward, terminated, truncated, _ = eval_env.step(action)
         done = terminated or truncated
-        new_reward = reward_shaping(old_reward, state, next_state, done, GAMMA)
+        new_reward = reward_shaping(old_reward, state, next_state, done, GAMMA, False)
         shaped_total_reward += new_reward
         old_total_reward += old_reward
 

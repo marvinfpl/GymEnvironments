@@ -21,3 +21,17 @@ class DeepQNetwork(nn.Module):
         a = self.advantage(y)
         v = self.value(y)
         return v + (a - a.mean(dim=1, keepdim=True))
+    
+class RewardNetwork(nn.Module):
+    def __init__(self, n_states, hidden=128):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(n_states, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, 1)
+        )
+
+    def forward(self, x):
+        return self.net(x)

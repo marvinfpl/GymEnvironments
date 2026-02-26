@@ -1,33 +1,40 @@
+from math import sqrt
+import torch
+import torch.optim as optim
+from network import RewardNetwork
+
+LR = 2e-3
+
+reward_net = RewardNetwork(2, 128)
+optimizer = optim.Adam(reward_net.parameters(), lr=LR)
 
 def polyak_averaging(tau, tgt_network, dqn):
     for tgt_param, param in zip(tgt_network.parameters(), dqn.parameters()):
         tgt_param.data.copy_(tau * param.data + (1.0 - tau) * tgt_param.data)
 
-def potential_function(state):
-    x, v = state
-    xnorm = (x + 1.2) / 1.8
-    vnorm = (v + 0.07) / 0.14
-    
-    position_reward = 10 * xnorm
-    velocity_reward = 2 * vnorm ** 2
-    """
-    threshold_bonus = 0
-    if x > -0.4:
-        threshold_bonus += 10
-    if x > 0.0:
-        threshold_bonus += 20
-    if x > 0.3:
-        threshold_bonus += 30
-    """
-    return position_reward + velocity_reward #+ threshold_bonus
-
-def reward_shaping(reward, state, next_state, done, gamma):
+def reward_shaping(reward, state, next_state, done, gamma, training=False):
     if done and next_state[0] >= 0.5:
         return 100.0
     
-    shaped = reward + gamma * potential_function(next_state) - potential_function(state)
+    if training:
+        reward_net.train()
+    else:
+        reward_net.eval()
     
-    #if next_state[0] > state[0]:
-    #    shaped += 5.0
-    
-    return shaped
+    state_t = torch.tensor(state, dtype=torch.float32).unsqueeze(0)
+    value = reward_net(state_t)
+    if done:
+        next_value = 0.0
+    else:
+        next_state_t = torch.tensor(next_state, dtype=torch.float32).unsqueeze(0)
+        next_value = reward_net(next_state_t).detach()
+    shaped = (reward + gamma * next_value - value).detach()
+
+    td_target = reward + gamma * next_value
+    loss = (value - td_target).pow(2).mean()
+    optimizer.zero_grad()
+    loss.backward()
+    torch.nn.utils.clip_grad_norm_(reward_net.parameters(), 2.0)
+    optimizer.step()
+
+    return shaped.item()

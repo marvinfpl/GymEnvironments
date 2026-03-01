@@ -1,12 +1,11 @@
+import gymnasium as gym
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import gymnasium as gym
 import numpy as np
 from collections import deque
-import wandb
 
-class RolloutBuffer:
+class RolloutBuffer():
     def __init__(self):
         self.states = []
         self.actions = []
@@ -15,12 +14,12 @@ class RolloutBuffer:
         self.logprobs = []
         self.values = []
 
-    def append(self, state, action, reward, done, logp, value):
+    def append(self, state, action, reward, done, logprob, value):
         self.states.append(state)
         self.actions.append(action)
         self.rewards.append(reward)
         self.dones.append(done)
-        self.logprobs.append(logp)
+        self.logprobs.append(logprob)
         self.values.append(value)
 
     def clear(self):
@@ -31,21 +30,24 @@ class RolloutBuffer:
         self.logprobs.clear()
         self.values.clear()
 
-class ActorCritic(nn.Module):
-    def __init__(self, n_states, n_actions, hidden):
+class ActorNetwork(nn.Module):
+    def __init__(self, n_states, n_actions, hidden=128):
         super().__init__()
-        self.actor = nn.Sequential(
+        self.net = nn.Sequential(
             nn.Linear(n_states, hidden),
             nn.Tanh(),
             nn.Linear(hidden, hidden),
             nn.Tanh(),
             nn.Linear(hidden, n_actions),
-            #nn.Softmax(dim=-1),
         )
 
-        # initialize q_values
-
-        self.critic = nn.Sequential(
+    def forward(self, x):
+        return self.net(x)
+    
+class CriticNetwork(nn.Module):
+    def __init__(self, n_states, hidden=128):
+        super().__init__()
+        self.net = nn.Sequential(
             nn.Linear(n_states, hidden),
             nn.Tanh(),
             nn.Linear(hidden, hidden),
@@ -53,202 +55,182 @@ class ActorCritic(nn.Module):
             nn.Linear(hidden, 1),
         )
 
-        # initialize state values
-
     def forward(self, x):
-        probs = self.actor(x)
-        state_values = self.critic(x)
-        return probs, state_values
+        return self.net(x)
     
-    def select_action(self, state): # how to get a general method for checking dimensions?
-        state_t = torch.tensor(state, dtype=torch.float32).unsqueeze(0)
-        logits, value = self.forward(state_t)
-        dist = torch.distributions.Categorical(logits=logits)
-        action = dist.sample()
-        logp = dist.log_prob(action)
-        return action, value.view(-1), logp
-
-    def evaluate_action(self, state, action):
-        state_t = torch.clone(state)
-        logits, value = self.forward(state_t)
-        dist = torch.distributions.Categorical(logits=logits)
-        logp = dist.log_prob(action)
-        entropy = dist.entropy()
-        return value.view(-1), logp, entropy
-    
-    def deterministic_policy(self, state):
-        state_t = torch.tensor(state, dtype=torch.float32).unsqueeze(0)
-        logits, value = self.forward(state_t)
-        action = logits.argmax().item()
-        return action, value.view(-1)
-
-    
-class PPOAgent():
-    def __init__(self, env_name, gamma=0.99, lambda_gae=0.98, lr_actor=3e-4, lr_critic=3e-4, hidden=128, epochs=10, rollout_steps=2048, eps_clip=0.2, entropy_coef=0.02, value_loss_coef=0.5, batch_size=64, max_grad_norm=1.0):
-        self.env_name = env_name
-        env = gym.make(env_name)
-        n_states = env.observation_space.shape[0]
-        n_actions = env.action_space.n
-        env.close()
-
-        self.policy = ActorCritic(n_states, n_actions, hidden)
-
+class PPOAgent:
+    def __init__(self, gamma=0.99, lambda_gae=0.95, lr_critic=3e-4, lr_actor=3e-4, batch_size=64, epochs=10, rollout_steps=4096, hidden=128, entropy_coef=0.02, value_loss_coef=0.5, eps_clip=0.2, grad_norm=1.0):
         self.gamma = gamma
         self.lambda_gae = lambda_gae
-        self.lr_actor = lr_actor
         self.lr_critic = lr_critic
+        self.lr_actor = lr_actor
+        self.batch_size = batch_size
         self.epochs = epochs
         self.rollout_steps = rollout_steps
-        self.eps_clip = eps_clip
         self.entropy_coef = entropy_coef
         self.value_loss_coef = value_loss_coef
-        self.batch_size = batch_size
-        self.max_grad_norm = max_grad_norm
+        self.eps_clip = eps_clip
+        self.grad_norm = grad_norm
 
-        self.optim_actor = optim.Adam(self.policy.actor.parameters(), lr=lr_actor)
-        self.optim_critic = optim.Adam(self.policy.critic.parameters(), lr=lr_critic)
-        
+        env = gym.make("MountainCar-v0")
+        n_states = env.observation_space.shape[0]
+        n_actions = env.action_space.n 
+        env.close()
+
+        self.actor = ActorNetwork(n_states, n_actions, hidden)
+        self.optim_actor = optim.Adam(self.actor.parameters(), lr=lr_actor)
+        self.critic = CriticNetwork(n_states, hidden)
+        self.optim_critic = optim.Adam(self.critic.parameters(), lr=lr_critic)
+
         self.buffer = RolloutBuffer()
 
-        # wandb logger?
-
     def train(self):
-        self.policy.actor.train()
-        self.policy.critic.train()
+        self.actor.train()
+        self.critic.train()
 
     def eval(self):
-        self.policy.actor.eval()
-        self.policy.critic.eval()
-    
+        self.actor.eval()
+        self.critic.eval()
+
     def compute_gae(self, next_value):
-        gae = 0.0
         advantages = []
+        gae = 0.0
         values = torch.cat(self.buffer.values + [next_value])
-        rewards = torch.tensor(self.buffer.rewards, dtype=torch.float32)
         dones = torch.tensor(self.buffer.dones, dtype=torch.float32)
+        rewards = torch.tensor(self.buffer.rewards, dtype=torch.float32)
+
         for t in reversed(range(len(rewards))):
             td = rewards[t] + self.gamma * values[t+1] * (1.0 - dones[t]) - values[t]
             gae = self.gamma * self.lambda_gae * gae * (1.0 - dones[t]) + td
             advantages.insert(0, gae)
 
-        advantages = torch.stack(advantages)
+        advantages = torch.stack(advantages).view(-1)
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
         return advantages
 
-    
-    def update_policy(self, next_value):
-        advantages = self.compute_gae(next_value)
-
-        states_t = torch.from_numpy(np.array(self.buffer.states)).float()
-        actions_t = torch.from_numpy(np.array(self.buffer.actions)).to(torch.int64)
-        old_logprobs_t = torch.stack(self.buffer.logprobs).float().squeeze(-1)
-        values_t = torch.cat(self.buffer.values).float().squeeze(-1)
-
-        returns = advantages + values_t
-
-        for _ in range(self.epochs):
-            idx = torch.randperm(states_t.size(0))
-
-            for start in range(0, states_t.size(0), self.batch_size):
-                end = start+self.batch_size
-                mb_idx = idx[start:end]
-
-                mb_states = states_t[mb_idx]
-                mb_actions = actions_t[mb_idx]
-                mb_old_logp = old_logprobs_t[mb_idx].detach()
-                mb_old_values = values_t[mb_idx].detach()
-                mb_advantage = advantages[mb_idx].detach()
-                mb_returns = returns[mb_idx].detach()
-                
-                new_values, new_logp, entropy = self.policy.evaluate_action(mb_states, mb_actions)
-
-                ratio = torch.exp(new_logp - mb_old_logp)
-                surr1 = ratio * mb_advantage
-                surr2 = torch.clamp(ratio, 1.0 - self.eps_clip, 1.0 + self.eps_clip) * mb_advantage
-                actor_loss = -torch.min(surr1, surr2).mean() - entropy.mean() * self.entropy_coef
-
-                self.optim_actor.zero_grad()
-                actor_loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.policy.actor.parameters(), self.max_grad_norm)
-                self.optim_actor.step()
-
-                new_values = new_values.view(-1)
-                clipped_values = torch.clamp(new_values - mb_old_values, -self.eps_clip, self.eps_clip) + mb_old_values
-                clipped_loss = (mb_returns - clipped_values).pow(2)
-                unclipped_loss = (mb_returns - new_values).pow(2)
-                critic_loss = torch.max(unclipped_loss, clipped_loss).mean() * self.value_loss_coef
-
-                self.optim_critic.zero_grad()
-                critic_loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.policy.critic.parameters(), self.max_grad_norm)
-                self.optim_critic.step()
-
-        self.buffer.clear()
-
-    def learn(self, env: gym.Env, total_timesteps=100_000):
-        self.train()
+    def collect_rollouts(self, env: gym.Env, max_steps=100_000):
         state, _ = env.reset()
+        mean_rewards = deque(maxlen=100)
         total_reward = 0.0
-        mean_reward = deque(maxlen=100)
-
-        for step in range(1, total_timesteps):
+        
+        for step in range(1, 1+max_steps):
             state = normalize_state(state)
-            action, value, logp = self.policy.select_action(state)
-            next_state, reward, terminated, truncated, _ = env.step(action.item())
-            total_reward += reward
-            done = terminated or truncated
+            state_t = torch.tensor(state, dtype=torch.float32).unsqueeze(0)
+            logits = self.actor(state_t)
+            value = self.critic(state_t).view(-1)
+            dist = torch.distributions.Categorical(logits=logits)
+            action = dist.sample()
+            logprob = dist.log_prob(action)
 
-            self.buffer.append(state, action.item(), reward, done, logp, value)
+            next_state, reward, terminated, truncated, _ = env.step(action.item())
+            done = terminated or truncated
+            total_reward += reward
+
+            self.buffer.append(state, action.item(), reward, done, logprob, value)
 
             state = next_state
 
             if done:
                 state, _ = env.reset()
-                mean_reward.append(total_reward)
+                mean_rewards.append(total_reward)
+
                 if step % (200 * 50) == 0:
-                    print(f" --- step: {step}, total reward: {total_reward}, mean reward: {np.mean(mean_reward)} --- ")
+                    print(f" step: {step}, total reward: {total_reward}, mean reward: {np.mean(mean_rewards)} --- ")
+                
                 total_reward = 0.0
 
-            if step %  self.rollout_steps == 0:
+            if step % self.rollout_steps == 0:
+
                 if done:
                     next_value = torch.zeros(1)
                 else:
                     with torch.no_grad():
                         state = normalize_state(state)
                         state_t = torch.tensor(state, dtype=torch.float32).unsqueeze(0)
-                        _, next_value = self.policy(state_t)
-                        next_value = next_value.view(-1)
-                self.update_policy(next_value)
+                        next_value = self.critic(state_t).view(-1)
 
-        env.close()
+                advantages = self.compute_gae(next_value)
+                
 
-    def test(self, env: gym.Env, episodes=10):
-        self.eval()
+                states_t = torch.from_numpy(np.array(self.buffer.states)).float()
+                actions_t = torch.from_numpy(np.array(self.buffer.actions)).to(torch.int64)
+                logprobs_t = torch.stack(self.buffer.logprobs).float().squeeze(-1)
+                values_t = torch.cat(self.buffer.values).float().squeeze(-1)
+
+                returns = advantages + values_t
+
+                for _ in range(self.epochs):
+                    size = states_t.size(0)
+                    idx = torch.randperm(size)
+
+                    for start in range(0, size, self.batch_size):
+                        end = start+self.batch_size
+                        mb_idx = idx[start:end]
+
+                        mb_states = states_t[mb_idx]
+                        mb_actions = actions_t[mb_idx]
+                        mb_logprobs = logprobs_t[mb_idx].detach()
+                        mb_values = values_t[mb_idx].detach()
+                        mb_advantages = advantages[mb_idx].detach()
+                        mb_returns = returns[mb_idx].detach()
+
+
+                        logits = self.actor(mb_states)
+                        dist = torch.distributions.Categorical(logits=logits)
+                        new_logprobs = dist.log_prob(mb_actions)
+                        entropies = dist.entropy()
+                        new_values = self.critic(mb_states)
+
+                        ratio = torch.exp(new_logprobs - mb_logprobs)
+                        surr2 = torch.clamp(ratio, 1.0 - self.eps_clip, 1.0 + self.eps_clip) * mb_advantages
+                        surr1 = ratio * mb_advantages
+                        actor_loss = -torch.min(surr1, surr2).mean() - entropies.mean() * self.entropy_coef
+
+                        self.optim_actor.zero_grad()
+                        actor_loss.backward()
+                        torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.grad_norm)
+                        self.optim_actor.step()
+
+                        new_values = new_values.view(-1)
+                        value_clipped = torch.clamp(new_values - mb_values, -self.eps_clip, self.eps_clip) + mb_values
+                        clipped_loss = (mb_returns - value_clipped).pow(2)
+                        unclipped_loss = (mb_returns - new_values).pow(2)
+                        critic_loss = torch.max(clipped_loss, unclipped_loss).mean() * self.value_loss_coef
+
+                        self.optim_critic.zero_grad()
+                        critic_loss.backward()
+                        torch.nn.utils.clip_grad_norm_(self.critic.parameters(), self.grad_norm)
+                        self.optim_critic.step()
+
+                self.buffer.clear()
+
+    def learn(self, max_steps=100_000):
+        self.actor.train()
+        self.critic.train()
+        env = gym.make("MountainCar-v0")
+        
+        self.collect_rollouts(env, max_steps)
+
+    def evaluate(self, episodes=10):
+        env = gym.make("MountainCar-v0", render_mode="human")
+
         for episode in range(episodes):
             state, _ = env.reset()
-            total_reward = 0.0
             done = False
-
-            # stochastic policy
-           
+            total_reward = 0.0
             while not done:
                 state = normalize_state(state)
-                action, _, _ = self.policy.select_action(state)
+                state_t = torch.tensor(state, dtype=torch.float32).unsqueeze(0)
+                with torch.no_grad():
+                    logits = self.actor(state_t)
+                    dist = torch.distributions.Categorical(logits=logits)
+                    action = dist.sample()
                 state, reward, terminated, truncated, _ = env.step(action.item())
-                total_reward += reward
-                done = terminated or truncated
-            
-            # deterministic policy
-            """
-            while not done:
-                state = normalize_state(state)
-                action, _ = self.policy.deterministic_policy(state)
-                state, reward, terminated, truncated, _ = env.step(action)
-                total_reward += reward
-                done = terminated or truncated
-            """
 
-            print(f" --- Episode: {episode}, Total reward: {total_reward} --- ")
+                total_reward += reward
+                done = terminated or truncated
+
+            print(f" --- episode: {episode}, total reward: {total_reward} --- ")
 
         env.close()
 
@@ -259,15 +241,6 @@ def normalize_state(state):
     return np.array([xnorm, vnorm], dtype=np.float32)
 
 if __name__ == '__main__':
-    STEPS = 400_000
-    EVAL = 10
-    rewards = deque(maxlen=100)
-
-    env_name = "MountainCar-v0"
-    env_train = gym.make(env_name)
-    env_eval = gym.make(env_name, render_mode='human')
-    
-    model = PPOAgent(env_name, rollout_steps=4096, entropy_coef=0.005)
-    model.learn(env_train, STEPS)
-    model.test(env_eval)
-
+    model = PPOAgent()
+    model.learn(400_000)
+    model.evaluate()
